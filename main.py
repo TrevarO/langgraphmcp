@@ -71,11 +71,10 @@ async def main():
                     break
                 
                 # Create state
-                state: GraphState = {
+                state = {
                     "messages": [HumanMessage(content=user_input)],
                     "current_mcp_server": None,
                     "tool_outputs": [],
-                    "error_messages": []
                 }
                 
                 # Execute graph
