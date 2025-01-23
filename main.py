@@ -5,9 +5,13 @@ from datetime import datetime
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langgraph_mcp.assistant_graph import graph, GraphState
+import json
 
 # Load environment variables
 load_dotenv()
+
+if not os.getenv("BRAVE_API_KEY"):
+    raise ValueError("BRAVE_API_KEY not found in environment variables")
 
 # MCP server configurations
 MCP_SERVER_CONFIG = {
@@ -29,7 +33,8 @@ MCP_SERVER_CONFIG = {
             "args": ["exec", "@modelcontextprotocol/server-brave-search", "--"],
             "description": "Web search operations: general queries, local business search, news search",
             "env": {
-                "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+                # Use actual environment variable instead of placeholder
+                "BRAVE_API_KEY": os.getenv("BRAVE_API_KEY")
             }
         },
         "mcp-reasoner": {
@@ -45,6 +50,12 @@ async def debug_graph_invoke(state, config):
     print("\n=== DEBUG: graph.ainvoke start ===")
     print(f"Initial state: {state}")
     print(f"Config: {config}")
+    
+    # NEW: Log server configurations
+    print("\nMCP Server Configurations:")
+    for server, details in config['configurable']['mcp_server_config']['mcpServers'].items():
+        print(f"- {server}: {details['description']}")
+    
     try:
         result = await graph.ainvoke(state, config)
         print(f"Result: {result}")
@@ -55,6 +66,11 @@ async def debug_graph_invoke(state, config):
         print(f"Error type: {type(e)}")
         import traceback
         print(f"Traceback: {traceback.format_exc()}")
+        
+        # NEW: Log additional context
+        print("\nFull State Dump:")
+        print(json.dumps(state, indent=2, default=str))
+        
         raise
 
 async def main():
