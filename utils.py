@@ -33,15 +33,13 @@ def format_docs(docs: Sequence[Document]) -> str:
     return "\n\n".join(doc.page_content for doc in docs)
 
 def load_chat_model(model_string: str) -> ChatOpenAI:
-    """Load a chat model based on a model string.
-    
-    Args:
-        model_string: String identifying the model (e.g., "openai/gpt-4")
-        
-    Returns:
-        Configured chat model instance
-    """
-    provider, model = model_string.split("/")
+    """Load a chat model based on a model string."""
+    if "/" not in model_string:
+        # Default to OpenAI if no provider specified
+        provider = "openai"
+        model = model_string
+    else:
+        provider, model = model_string.split("/")
     
     if provider == "openai":
         return ChatOpenAI(
