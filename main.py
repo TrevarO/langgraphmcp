@@ -41,6 +41,22 @@ MCP_SERVER_CONFIG = {
     }
 }
 
+async def debug_graph_invoke(state, config):
+    print("\n=== DEBUG: graph.ainvoke start ===")
+    print(f"Initial state: {state}")
+    print(f"Config: {config}")
+    try:
+        result = await graph.ainvoke(state, config)
+        print(f"Result: {result}")
+        print("=== DEBUG: graph.ainvoke end ===\n")
+        return result
+    except Exception as e:
+        print(f"Error in graph.ainvoke: {str(e)}")
+        print(f"Error type: {type(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        raise
+
 async def main():
     """Main execution loop"""
     print("Starting LangGraph MCP system with router agent...")
@@ -52,8 +68,8 @@ async def main():
         # Initialize configuration
         config = {
             "configurable": {
-                "routing_model": "gpt-4-0125-preview",
-                "execution_model": "gpt-4-0125-preview",
+                "routing_model": "openai/gpt-4-0125-preview",
+                "execution_model": "openai/gpt-4-0125-preview",
                 "mcp_server_config": MCP_SERVER_CONFIG
             }
         }
@@ -80,7 +96,7 @@ async def main():
                 # Execute graph
                 print("\nProcessing request...")
                 start_time = datetime.now()
-                final_state = await graph.ainvoke(state, config)
+                final_state = await debug_graph_invoke(state, config)
                 end_time = datetime.now()
                 
                 # Display results
