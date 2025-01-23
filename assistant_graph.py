@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from typing import Annotated, Sequence, Dict, List, TypedDict, Any
 from typing_extensions import NotRequired
-from langchain_core.messages import BaseMessage, AIMessage
+import json
+import re
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END, add_messages
 from langgraph_mcp.configuration import Configuration
@@ -10,6 +12,7 @@ from langgraph_mcp.utils import get_message_text, load_chat_model
 from langgraph_mcp.prompts import ROUTER_SYSTEM_PROMPT, TOOL_EXECUTOR_SYSTEM_PROMPT
 
 class GraphState(TypedDict):
+    """State type for the graph."""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     current_mcp_server: NotRequired[str]
     tool_outputs: List[str]
@@ -24,7 +27,14 @@ async def route_request(state: GraphState, config: Dict) -> Dict[str, Any]:
         for name, details in configuration.mcp_server_config["mcpServers"].items()
     )
     
-    print(f"Tool descriptions: {tool_descriptions}")
+    # NEW: Add query parsing
+    user_query = get_message_text(state["messages"][-1])
+    query_actions = re.split(r'\band\b', user_query, flags=re.IGNORECASE)
+    
+    # Log parsed actions for debugging
+    print("Parsed Query Actions:")
+    for action in query_actions:
+        print(f"- {action.strip()}")
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", ROUTER_SYSTEM_PROMPT),
@@ -36,25 +46,17 @@ async def route_request(state: GraphState, config: Dict) -> Dict[str, Any]:
     result = await model.ainvoke(
         prompt.format_messages(
             tool_descriptions=tool_descriptions,
-            input=get_message_text(state["messages"][-1]),
+            input=user_query,  # Use original query
             system_time=datetime.now(tz=timezone.utc).isoformat()
         )
     )
-    print(f"Model result: {result}")
     
     tool_name = result.content.strip().lower()
-    tool_name = tool_name.replace('"', '').replace("'", '')
-    
-    if tool_name == "none":
-        return {
-            "messages": [AIMessage(content="I need more information. Could you please clarify?")],
-            "current_mcp_server": None,
-            "tool_outputs": []
-        }
+    print(f"Selected tool: {tool_name}")
     
     return {
         "messages": [AIMessage(content=f"Using {tool_name} to help you...")],
-        "current_mcp_server": tool_name,
+        "current_mcp_server": None if tool_name == "none" else tool_name,
         "tool_outputs": []
     }
 
@@ -75,79 +77,112 @@ async def execute_tool(state: GraphState, config: Dict) -> Dict[str, Any]:
     try:
         server_config = configuration.mcp_server_config["mcpServers"][server_name]
         print(f"Getting tools from {server_name}")
-        tools = await mcp.apply(server_name, server_config, mcp.GetTools())
-        print(f"Retrieved tools: {tools}")
+        mcp_tools = await mcp.apply(server_name, server_config, mcp.GetTools())
+        print(f"MCP Tools received: {json.dumps(mcp_tools, indent=2)}")
 
-        # Create LangChain tools from MCP tools
+        # Convert MCP tools to LangChain format
         langchain_tools = []
-        for tool in tools:
-            if isinstance(tool, dict) and 'function' in tool:
-                func = tool['function']
-                langchain_tools.append({
-                    'name': func['name'],
-                    'description': func.get('description', ''),
-                    'parameters': func.get('parameters', {})
-                })
+        for tool in mcp_tools:
+            try:
+                if isinstance(tool, dict) and 'function' in tool:
+                    func = tool['function']
+                    langchain_tool = {
+                        'type': 'function',
+                        'function': {
+                            'name': func.get('name', ''),
+                            'description': func.get('description', ''),
+                            'parameters': func.get('parameters', {'type': 'object', 'properties': {}})
+                        }
+                    }
+                    langchain_tools.append(langchain_tool)
+                    print(f"Converted tool: {json.dumps(langchain_tool, indent=2)}")
+            except Exception as tool_error:
+                print(f"Error converting tool: {str(tool_error)}")
+                continue
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", TOOL_EXECUTOR_SYSTEM_PROMPT),
-            ("human", "{input}")
-        ])
+        # Get original user query
+        user_query = next(msg.content for msg in reversed(state["messages"]) 
+                         if isinstance(msg, HumanMessage))
+        print(f"Using original user query: {user_query}")
+
+        # NEW: Support for multiple tool calls
         model = load_chat_model(configuration.execution_model)
-
-        # Use simplified tool format
-        result = await model.invoke(
-            prompt.format_messages(
-                tool_description=server_config["description"],
-                input=get_message_text(state["messages"][-1]),
-                tools=langchain_tools
-            ),
-            config={"tools": langchain_tools}  # Pass tools in config
-        )
+        result = await model.bind_tools(
+            tools=langchain_tools,
+            tool_choice="auto"
+        ).ainvoke(user_query)
+        
+        tool_results = []
+        for tool_call in result.additional_kwargs.get('tool_calls', []):
+            tool_name = tool_call['function']['name']
+            tool_args = json.loads(tool_call['function']['arguments'])
+            
+            print(f"Executing tool call: {tool_name} with args: {tool_args}")
+            
+            tool_result = await mcp.apply(
+                server_name, 
+                server_config, 
+                mcp.RunTool(tool_name, **tool_args)
+            )
+            tool_results.append(tool_result)
+        
+        if tool_results:
+            return {
+                "messages": [AIMessage(content="Multiple tools executed successfully")],
+                "current_mcp_server": None,
+                "tool_outputs": [str(result) for result in tool_results]
+            }
         
         return {
-            "messages": [result],
+            "messages": [AIMessage(content="No tool call was generated.")],
             "current_mcp_server": None,
-            "tool_outputs": [str(result)]
+            "tool_outputs": []
         }
         
     except Exception as e:
         print(f"Error details: {str(e)}")
+        print(f"Error type: {type(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
         return {
-            "messages": [AIMessage(content=f"Error: {str(e)}")],
+            "messages": [AIMessage(content=f"Error executing tool: {str(e)}")],
+            "current_mcp_server": None,
+            "tool_outputs": []
+        }
+        
+        return {
+            "messages": [AIMessage(content="No tool call was generated.")],
             "current_mcp_server": None,
             "tool_outputs": []
         }
         
     except Exception as e:
-        print(f"Error details: {str(e)}")  # Add more detailed error logging
+        print(f"Error details: {str(e)}")
+        print(f"Error type: {type(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
         return {
-            "messages": [AIMessage(content=f"Error: {str(e)}")],
+            "messages": [AIMessage(content=f"Error executing tool: {str(e)}")],
             "current_mcp_server": None,
             "tool_outputs": []
         }
-        print(f"Error occurred: {e}")
-        print(f"Returning: {return_state}")
-        return return_state
 
-def route_or_end(state: GraphState) -> str:
-    """Decide where to go next based on whether a tool is selected."""
+def should_continue(state: GraphState) -> str:
     print("\n=== DEBUG: should_continue ===")
     print(f"Input state: {state}")
-    current_server = state.get("current_mcp_server")
-    next_node = "execute_tool" if current_server and current_server != "none" else END
+    next_node = "execute_tool" if state.get("current_mcp_server") else END
     print(f"Next node: {next_node}")
     print("=== DEBUG: should_continue end ===\n")
     return next_node
 
+# Build and compile graph
 workflow = StateGraph(GraphState)
 workflow.add_node("route_request", route_request)
 workflow.add_node("execute_tool", execute_tool)
 
-# Simplified edge definition for v0.2.65
 workflow.add_conditional_edges(
     "route_request",
-    route_or_end,  # This now returns string directly
+    should_continue,
     {
         "execute_tool": "execute_tool",
         END: END

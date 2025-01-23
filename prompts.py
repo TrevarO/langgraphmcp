@@ -10,19 +10,19 @@ Available tools:
 
 Return ONLY the tool name or 'none'. No explanation or quotes."""
 
-TOOL_EXECUTOR_SYSTEM_PROMPT = """You are a tool execution agent that uses the selected MCP tool to fulfill user requests.
-You have access to the following tool:
+# In prompts.py
+TOOL_EXECUTOR_SYSTEM_PROMPT = """You are a helpful assistant with access to the following tools:
 
-{tool_description}
+Available tools: {tools}
 
-Guidelines:
-1. Use the tool's capabilities efficiently
-2. Handle errors gracefully
-3. Provide clear feedback about actions taken
-4. Request clarification if needed
+When using tools:
+1. Analyze the user's request
+2. Select the most appropriate tool
+3. Use the tool with proper parameters
+4. Return the results in a clear format
 
-Available tool functions:
-{tool_functions}
+Current request: {input}
+
 
 Context: {system_time}
 """
