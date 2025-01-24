@@ -1,27 +1,47 @@
 from datetime import datetime, timezone
-from typing import Annotated, Sequence, Dict, List, TypedDict, Any
+from typing import Dict, List, TypedDict, Any
 from typing_extensions import NotRequired
 import json
+import logging
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph, END, add_messages
-from langgraph_mcp.configuration import Configuration
-from langgraph_mcp import mcp_wrapper as mcp
-from langgraph_mcp.utils import get_message_text, load_chat_model
-from langgraph_mcp.prompts import ROUTER_SYSTEM_PROMPT, TOOL_EXECUTOR_SYSTEM_PROMPT
+from langgraph.graph import StateGraph, END
+from src.langgraph_mcp.tool_execution import execute_tool, route_request
+from src.langgraph_mcp.transport_manager import transport_manager
+from src.langgraph_mcp.configuration import Configuration
+from src.langgraph_mcp import mcp_wrapper as mcp
+from src.langgraph_mcp.utils import get_message_text, load_chat_model
+from src.langgraph_mcp.cleanup_manager import cleanup_manager
+
+logger = logging.getLogger(__name__)
+
+TOOL_INSTRUCTIONS = """You are an AI assistant with access to various tools. When using tools:
+1. For search queries, use the provided tools directly without asking for clarification
+2. For file operations, execute the requested operation directly
+3. Return the results in a clear, concise format
+
+Current tools available:
+1. brave_web_search: Use for general web searches and current information
+2. brave_local_search: Use for location-specific queries
+3. filesystem: Use for file operations
+4. mcp-reasoner: Use for complex reasoning tasks
+
+DO NOT ask the user for clarification unless the request is completely unclear.
+When using search tools, formulate and execute the search directly."""
 
 class GraphState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]
+    messages: List[BaseMessage]
     current_mcp_server: NotRequired[str]
     tool_outputs: List[str]
 
-# Initialize prompt template at module level
-prompt = ChatPromptTemplate.from_messages([
-    ("system", ROUTER_SYSTEM_PROMPT),
+# Initialize prompt templates
+router_prompt = ChatPromptTemplate.from_messages([
+    ("system", TOOL_INSTRUCTIONS),
     ("human", "{input}")
 ])
 
-def convert_to_langchain_tools(mcp_tools):
+def convert_to_langchain_tools(mcp_tools: List[Dict]) -> List[Dict]:
+    """Convert MCP tools to LangChain format"""
     langchain_tools = []
     for tool in mcp_tools:
         if isinstance(tool, dict) and 'function' in tool:
@@ -36,135 +56,59 @@ def convert_to_langchain_tools(mcp_tools):
             })
     return langchain_tools
 
-def process_tool_result(result):
-    if isinstance(result, dict):
-        if 'text' in result:
-            return result['text']
-        if 'type' in result and result['type'] == 'text':
-            return result.get('text', str(result))
-    return str(result)
-
-async def route_request(state: GraphState, config: Dict) -> Dict[str, Any]:
+async def execute_tool_with_cleanup(name: str, tool_type: str, config: Dict, query: str) -> Dict:
+    """Execute tool and ensure proper cleanup"""
     try:
-        print("\nDEBUG [route_request] Starting...")
-        configuration = Configuration.from_runnable_config(config)
-        tool_descriptions = "\n".join(
-            f"- {name}: {details['description']}"
-            for name, details in configuration.mcp_server_config["mcpServers"].items()
-        )
-        print(f"DEBUG [route_request] Available tools:\n{tool_descriptions}")
-        
-        model = load_chat_model(configuration.routing_model)
-        messages = prompt.format_messages(
-            tool_descriptions=tool_descriptions,
-            input=get_message_text(state["messages"][-1]),
-            system_time=datetime.now(tz=timezone.utc).isoformat()
-        )
-        print(f"\nDEBUG [route_request] Formatted messages: {messages}")
-        
-        result = await model.ainvoke(messages)
-        print(f"DEBUG [route_request] Model result: {result}")
-        
-        tool_name = result.content.strip().lower()
-        print(f"DEBUG [route_request] Selected tool: {tool_name}")
-        
-        return {
-            "messages": [AIMessage(content=f"Using {tool_name}...")],
-            "current_mcp_server": None if tool_name == "none" else tool_name,
-            "tool_outputs": []
-        }
-    except Exception as e:
-        import traceback
-        print(f"DEBUG [route_request] Error: {str(e)}")
-        print(f"DEBUG [route_request] Traceback: {traceback.format_exc()}")
-        return {
-            "messages": [AIMessage(content=f"Error: {str(e)}")], 
-            "current_mcp_server": None, 
-            "tool_outputs": []
-        }
-
-async def execute_tool(state: GraphState, config: Dict) -> Dict[str, Any]:
-    try:
-        server_name = state.get("current_mcp_server")
-        original_query = next((msg.content for msg in state["messages"] 
-                             if isinstance(msg, HumanMessage)), None)
-        
-        if not original_query:
-            return {"messages": [AIMessage(content="No query found")], 
-                   "current_mcp_server": None, "tool_outputs": []}
-
-        configuration = Configuration.from_runnable_config(config)
-        server_config = configuration.mcp_server_config["mcpServers"].get(server_name)
-        
+        server_config = config["mcpServers"].get(tool_type)
         if not server_config:
-            return {
-                "messages": [AIMessage(content=f"Tool {server_name} not found")],
-                "current_mcp_server": None,
-                "tool_outputs": []
-            }
+            raise ValueError(f"Tool configuration not found: {tool_type}")
 
-        # Get tools and execute query
-        tools = await mcp.apply(server_name, server_config, mcp.GetTools())
-        model = load_chat_model(configuration.execution_model)
-        result = await model.bind_tools(convert_to_langchain_tools(tools)).ainvoke(original_query)
+        # Get tools
+        tools = await mcp.apply(tool_type, server_config, mcp.GetTools())
         
-        if not result.additional_kwargs.get('tool_calls'):
-            return {
-                "messages": [AIMessage(content="No tool calls generated")],
-                "current_mcp_server": None,
-                "tool_outputs": []
-            }
-
-        # Execute tool and format response
-        tool_results = []
-        for tool_call in result.additional_kwargs['tool_calls']:
+        # Execute search directly without asking for clarification
+        if tool_type == "brave-search":
+            tool_name = "brave_web_search"
+            tool_args = {"query": query}
+        else:
+            model = load_chat_model(config.get("execution_model"))
+            result = await model.bind_tools(convert_to_langchain_tools(tools)).ainvoke(query)
+            
+            if not result.additional_kwargs.get('tool_calls'):
+                return {"content": result.content}
+                
+            tool_call = result.additional_kwargs['tool_calls'][0]
             tool_name = tool_call['function']['name']
             tool_args = json.loads(tool_call['function']['arguments'])
-            
-            tool_result = await mcp.apply(
-                server_name, 
-                server_config,
-                mcp.RunTool(tool_name, **tool_args)
-            )
-            
-            if isinstance(tool_result, str):
-                try:
-                    parsed = json.loads(tool_result)
-                    if isinstance(parsed, list):
-                        for item in parsed:
-                            if isinstance(item, dict) and 'text' in item:
-                                text = item['text'].replace('<strong>', '').replace('</strong>', '')
-                                text = text.replace('&amp;', '&')
-                                tool_results.append(text)
-                except json.JSONDecodeError:
-                    tool_results.append(tool_result)
-            else:
-                tool_results.append(str(tool_result))
 
-        formatted_output = "\n\n".join(tool_results)
-        return {
-            "messages": [AIMessage(content=formatted_output)],
-            "current_mcp_server": None,
-            "tool_outputs": tool_results
-        }
+        # Execute tool
+        result = await mcp.apply(tool_type, server_config, mcp.RunTool(tool_name, **tool_args))
+        
+        # Process result
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except json.JSONDecodeError:
+                pass
+                
+        return {"content": str(result)}
 
     except Exception as e:
-        print(f"Error in execute_tool: {str(e)}")
-        return {
-            "messages": [AIMessage(content=f"Error: {str(e)}")],
-            "current_mcp_server": None,
-            "tool_outputs": []
-        }
+        logger.error(f"Error executing tool {name}: {e}")
+        return {"error": str(e)}
+
+# Replace your existing route_request and execute_tool functions with these imports
+from src.langgraph_mcp.tool_execution import route_request, execute_tool
 
 def should_continue(state: GraphState) -> str:
+    logger.debug(f"GraphState: {state}")
     return "execute_tool" if state.get("current_mcp_server") else END
 
-# Modify the graph structure
+# Create and configure the graph
 workflow = StateGraph(GraphState)
 workflow.add_node("route_request", route_request)
 workflow.add_node("execute_tool", execute_tool)
 
-# Simplify the edges
 workflow.add_conditional_edges(
     "route_request",
     should_continue,
@@ -173,9 +117,7 @@ workflow.add_conditional_edges(
         END: END
     }
 )
-# Remove the loop back - we don't want to route again
-# workflow.add_edge("execute_tool", "route_request")  # Remove this line
-workflow.add_edge("execute_tool", END)  # Add this instead
+workflow.add_edge("execute_tool", END)
 workflow.set_entry_point("route_request")
 
 graph = workflow.compile()
