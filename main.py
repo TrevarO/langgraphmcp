@@ -1,104 +1,102 @@
-import os
 import asyncio
+import os
+import sys
 from datetime import datetime
-from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage
-from src.langgraph_mcp.assistant_graph import graph, GraphState
-import signal
-from langchain_core.messages import AIMessage
+from typing import Dict, Any
+from langchain_core.messages import HumanMessage, AIMessage
+from src.langgraph_mcp.assistant_graph import graph
+from src.langgraph_mcp.server_manager import server_manager, manage_event_loop
+from src.langgraph_mcp.config import MCP_SERVER_CONFIG
+from src.langgraph_mcp.logging_config import setup_logging
 
-load_dotenv()
+logger = setup_logging()
 
-MCP_SERVER_CONFIG = {
-    "mcpServers": {
-        "filesystem": {
-            "command": "npm.cmd" if os.name == "nt" else "npm",
-            "args": ["exec", "@modelcontextprotocol/server-filesystem", "--", "."],
-            "description": "File system operations",
-            "env": {}
-        },
-        "puppeteer": {
-            "command": "npm.cmd" if os.name == "nt" else "npm",
-            "args": ["exec", "@modelcontextprotocol/server-puppeteer", "--"],
-            "description": "Web browser automation",
-            "env": {}
-        },
-        "brave-search": {
-            "command": "npm.cmd" if os.name == "nt" else "npm",
-            "args": ["exec", "@modelcontextprotocol/server-brave-search", "--"],
-            "description": "Web search operations",
-            "env": {"BRAVE_API_KEY": os.getenv("BRAVE_API_KEY")}
-        },
-        "mcp-reasoner": {
-            "command": "npm.cmd" if os.name == "nt" else "npm",
-            "args": ["exec", "@modelcontextprotocol/server-mcp-reasoner", "--"],
-            "description": "Advanced reasoning",
-            "env": {}
-        }
-    }
-}
-
-async def cleanup_servers():
-    """Cleanup function for graceful shutdown"""
-    print("\nCleaning up servers...")
+async def start_mcp_server(name: str, config: Dict[str, Any]) -> asyncio.Task:
+    """Start and manage an MCP server process"""
     try:
-        # Get all tasks except the current one
-        tasks = [t for t in asyncio.all_tasks() 
-                if t is not asyncio.current_task()]
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Prepare command and environment
+        cmd = [config["command"]] + config["args"]
+        env = {**os.environ, **config.get("env", {})}
+        
+        # Create and register the process
+        process = await server_manager.create_server_process(name, cmd, env)
+        
+        # Create and register server task
+        async def run_server():
+            try:
+                await process.wait()
+            finally:
+                if process.returncode is None:
+                    process.terminate()
+                    await process.wait()
+                    
+        return await server_manager.add_server(name, run_server())
+        
     except Exception as e:
-        print(f"Cleanup error: {e}")
+        logger.error(f"Failed to start MCP server {name}: {e}")
+        raise
 
 async def main():
-    try:
-        if not all([os.getenv("BRAVE_API_KEY"), os.getenv("OPENAI_API_KEY")]):
-            raise ValueError("Missing required environment variables")
-        
-        config = {
-            "configurable": {
-                "routing_model": "openai/gpt-4-0125-preview",
-                "execution_model": "openai/gpt-4-0125-preview",
-                "mcp_server_config": MCP_SERVER_CONFIG
-            }
-        }
-
-        while True:
-            try:
-                user_input = input("\nEnter request (or 'exit' to quit): ")
-                if user_input.lower() in ['exit', 'quit', 'q']:
+    async with manage_event_loop() as loop:
+        try:
+            # Start MCP servers
+            servers = []
+            for name, config in MCP_SERVER_CONFIG["mcpServers"].items():
+                try:
+                    server = await start_mcp_server(name, config)
+                    servers.append(server)
+                except Exception as e:
+                    logger.error(f"Failed to start {name}: {e}")
+                    raise
+            
+            while True:
+                try:
+                    user_input = input("\nEnter request (or 'exit' to quit): ").strip()
+                    if user_input.lower() in ['exit', 'quit', 'q', '']:
+                        break
+                        
+                    state = {
+                        "messages": [HumanMessage(content=user_input)],
+                        "current_mcp_server": None,
+                        "tool_outputs": []
+                    }
+                    
+                    start_time = datetime.now()
+                    try:
+                        result = await graph.ainvoke(state, {
+                            "configurable": {
+                                "routing_model": "openai/gpt-4-0125-preview",
+                                "execution_model": "openai/gpt-4-0125-preview",
+                                "mcp_server_config": MCP_SERVER_CONFIG
+                            }
+                        })
+                        
+                        ai_messages = [msg for msg in result["messages"] 
+                                     if isinstance(msg, AIMessage)]
+                        if ai_messages:
+                            print(f"\nAssistant: {ai_messages[-1].content}")
+                    except Exception as e:
+                        logger.error(f"Error processing request: {e}")
+                        print(f"Error: {str(e)}")
+                        
+                    print(f"\nTime: {(datetime.now() - start_time).total_seconds():.2f}s")
+                    
+                except KeyboardInterrupt:
+                    if sys.platform == "win32":
+                        await server_manager.shutdown()
+                    logger.info("Operation cancelled by user")
                     break
-
-                state = {
-                    "messages": [HumanMessage(content=user_input)],
-                    "current_mcp_server": None,
-                    "tool_outputs": [],
-                }
-
-                start_time = datetime.now()
-                result = await graph.ainvoke(state, config)
-                
-                # Print only the last response
-                last_messages = [msg for msg in result["messages"] if isinstance(msg, AIMessage)]
-                if last_messages:
-                    print(f"\nAIMessage: {last_messages[-1].content}")
-                
-                print(f"\nTime: {(datetime.now() - start_time).total_seconds():.2f}s")
-
-            except KeyboardInterrupt:
-                print("\nOperation cancelled by user")
-                break
-            except Exception as e:
-                print(f"Error: {e}")
-
-    except Exception as e:
-        print(f"Fatal error: {e}")
-    finally:
-        await cleanup_servers()
+                except Exception as e:
+                    logger.error(f"Error in main loop: {e}", exc_info=True)
+                    
+        except Exception as e:
+            logger.error(f"Fatal error: {e}", exc_info=True)
+            raise
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nShutdown requested by user")
+        logger.info("Shutdown requested by user")
+    except Exception as e:
+        logger.error(f"Startup error: {e}", exc_info=True)
