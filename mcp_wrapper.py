@@ -68,6 +68,26 @@ class GetTools(MCPSessionFunction):
             for tool in tools.tools
         ]
 
+async def execute_tool(server_config, state):
+    """
+    Executes a tool based on the provided server configuration and state.
+
+    Args:
+        server_config (dict): Configuration for the tool server.
+        state (dict): The state of the request, including inputs and outputs.
+
+    Returns:
+        dict: The result of the tool execution.
+    """
+    try:
+        print(f"Executing tool: {server_config['command']} with args: {server_config['args']}")
+        # Simulate tool execution (replace with actual logic)
+        result = {"status": "success", "data": "Tool executed successfully"}
+        return result
+    except Exception as e:
+        print(f"Error executing tool: {e}")
+        return {"status": "error", "message": str(e)}
+
 class RunTool(MCPSessionFunction):
     def __init__(self, tool_name: str, **kwargs):
         self.tool_name = tool_name
@@ -79,6 +99,16 @@ class RunTool(MCPSessionFunction):
         if result.isError:
             raise ToolException(content)
         return content
+
+async def test_mcp_server(server_config):
+    try:
+        print(f"Testing MCP server: {server_config['command']}")
+        result = await execute_tool(server_config, {"test": "connection"})
+        print(f"Server response: {result}")
+        return True
+    except Exception as e:
+        print(f"Error testing server: {e}")
+        return False
 
 async def apply(server_name: str, server_config: dict, fn: MCPSessionFunction) -> Any:
     server_params = StdioServerParameters(

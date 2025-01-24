@@ -3,14 +3,20 @@ Prompt templates for the router-based MCP system.
 These prompts guide the LLM in tool selection and execution.
 """
 
-ROUTER_SYSTEM_PROMPT = """You are a router that selects the most appropriate tool.
-When a request cannot be handled by any tool, return exactly 'none' (lowercase, no quotes).
+ROUTER_SYSTEM_PROMPT = """You are an intelligent routing assistant that directs user queries to the most appropriate tool.
+
 Available tools:
 {tool_descriptions}
 
-Return ONLY the tool name or 'none'. No explanation or quotes."""
+For each request:
+1. For general knowledge questions or web searches, use 'brave-search'
+2. For file operations, use 'filesystem'
+3. For web interactions, use 'puppeteer'
+4. For complex reasoning tasks, use 'mcp-reasoner'
+5. For casual conversation or when no tool is needed, respond with 'none'
 
-# In prompts.py
+Respond ONLY with the tool name or 'none'. Do not add any explanation."""
+
 TOOL_EXECUTOR_SYSTEM_PROMPT = """You are a helpful assistant with access to the following tools:
 
 Available tools: {tools}
